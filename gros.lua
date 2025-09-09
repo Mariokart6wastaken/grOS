@@ -1,341 +1,318 @@
--- Computercraft Graphical "OS" with cooperative multitasking
--- Filename: gui_os.lua
--- Drop this into your .minecraft/computercraft/rom or run from shell.
---
--- Goals:
---  * Provide a simple graphical "desktop" (no windowing) with icons.
---  * Run multiple craftOS programs concurrently (cooperative multitasking).
---  * Keep programs largely compatible: they will see most common APIs
---    (term, fs, peripheral, os, colors, etc.) but their terminal will be
---    redirected to a pseudo-term so background apps don't stomp the screen.
---
--- Limitations / Notes:
---  * This is cooperative multitasking: programs must yield when waiting for
---    events or sleeping. The loader wraps os.sleep and event.pull to yield
---    to the kernel so other processes can run. Programs that busy-loop
---    without yielding will starve other processes.
---  * Full compatibility with every craftOS program is NOT guaranteed — some
---    native internals expect the real term or blocking shell.run behavior.
---    However most text-mode programs that use event.pull, os.pullEvent,
---    or sleep will behave properly.
---  * There is no windowing: when a program becomes the "foreground" app its
---    pseudo-term is copied to the real terminal; other apps run in the
---    background and don't draw.
---
--- How to use:
---  1. place this file on the computer and run `gui_os.lua`
---  2. Use the arrow keys or mouse to select icons and press Enter or click
---     to launch programs (they should be in the computer's filesystem).
---  3. Press Ctrl+T (or the assigned key) to switch to the task list.
---
--- Enjoy! Tweak and expand as needed.
+-- CCOS (ComputerCraft OS) - Starter graphical "OS" with cooperative multitasking
+-- Single-file starter. Drop into your ComputerCraft computer and run it.
+-- Goals: remain compatible with craftOS programs where possible, provide
+-- multitasking (cooperative), a simple graphical desktop (no windows),
+-- and a small API for apps to use.
 
-local term_native = term.native()
-local w, h = term.getSize()
+-- == CONFIG ==
+local SCREEN_WIDTH, SCREEN_HEIGHT = term.getSize()
+local ICONS_PER_ROW = 6
+local ICON_SIZE = {w = 12, h = 4}
+local TASK_TICK = 0.05 -- scheduler tick for timers (seconds)
 
--- Simple screen buffer helper (for pseudo-terminals)
-local function makeBuffer(w,h)
-  local chars = {}
-  local colors = {}
-  for y=1,h do
-    chars[y] = {}
-    colors[y] = {}
-    for x=1,w do
-      chars[y][x] = " "
-      colors[y][x] = {text=colours.white or colors and colors.white, bg=colours.black or colors and colors.black}
-    end
-  end
-  return {w=w,h=h,chars=chars,colors=colors}
+-- == Utility functions ==
+local function shallow_copy(t)
+  local r = {}
+  for k,v in pairs(t) do r[k]=v end
+  return r
 end
 
-local function drawBuffer(buf)
-  term.setCursorPos(1,1)
-  for y=1,buf.h do
-    local line = table.concat(buf.chars[y])
-    term.setCursorPos(1,y)
-    term.write(line)
+-- == Scheduler ==
+local Scheduler = {}
+Scheduler.__index = Scheduler
+function Scheduler.new()
+  return setmetatable({tasks = {}, waiting = {}, timers = {}, nextTimerId = 1}, Scheduler)
+end
+
+function Scheduler:createTask(func, name)
+  local co = coroutine.create(func)
+  local task = {co = co, name = name or "unnamed", status = "ready"}
+  table.insert(self.tasks, task)
+  return task
+end
+
+-- helper: resume task with args, catch errors
+function Scheduler:resumeTask(task, ...)
+  if coroutine.status(task.co) == "dead" then task.status = "dead"; return end
+  local ok, ret1, ret2, ret3 = coroutine.resume(task.co, ...)
+  if not ok then
+    -- error in task: mark dead and print error
+    task.status = "dead"
+    printError("[task error] " .. (task.name or "") .. ": " .. tostring(ret1))
+  else
+    task.status = coroutine.status(task.co)
+    return ret1, ret2, ret3
   end
 end
 
--- pseudo-term implementation: provides enough of the term API for programs
-local function makePseudoTerm()
-  local buf = makeBuffer(w,h)
-  local curx, cury = 1,1
-  local curTextColor = colours.white or colors.white
-  local curBG = colours.black or colors.black
+-- Tasks yield special tables to request waiting for events/timers
+-- yield types: {type="wait", filter=string or nil}  -- wait for an event matching filter
+--              {type="sleep", until= os.clock() + seconds} -- sleep
+--              {type="done"} -- finished
 
-  local t = {}
-  function t.clear()
-    for y=1,buf.h do
-      for x=1,buf.w do buf.chars[y][x] = ' ' end
-    end
-    curx,cury = 1,1
-  end
-  function t.clearLine()
-    for x=1,buf.w do buf.chars[cury][x] = ' ' end
-    curx = 1
-  end
-  function t.setCursorPos(x,y) curx,cury = x,y end
-  function t.getCursorPos() return curx,cury end
-  function t.setTextColor(c) curTextColor = c end
-  function t.setBackgroundColor(c) curBG = c end
-  function t.getSize() return buf.w, buf.h end
-  function t.write(s)
-    for i=1,#s do
-      local ch = s:sub(i,i)
-      if curx > buf.w then curx = 1; cury = cury + 1 end
-      if cury > buf.h then break end
-      buf.chars[cury][curx] = ch
-      curx = curx + 1
-    end
-  end
-  function t.blit(text, textColor, bgColor)
-    -- naive blit impl: ignore color strings and just write chars
-    t.write(text)
-  end
-  function t.getBuffer() return buf end
-  return t
-end
-
--- Process / kernel implementation
-local Kernel = {}
-Kernel.processes = {} -- pid -> process table
-Kernel.nextPid = 2 -- reserve 1 for kernel shell
-
-local function now() return os.epoch and os.epoch('ms') or (os.time()*1000) end
-
-local function makeProcess(chunkPath, args)
-  local pid = Kernel.nextPid; Kernel.nextPid = Kernel.nextPid + 1
-  local pseudoTerm = makePseudoTerm()
-  local env = {}
-  -- minimal API surface forwarded into the process environment
-  local allowed = {"fs","io","os","peripheral","colors","colours","textutils","sleep","paintutils","rs","redstone","commands","gps","http","term","string","table","math","parallel","sides","commands"}
-
-  -- copy globals but override term, os.sleep and event pulling to cooperate with kernel
-  for k,v in pairs(_G) do env[k] = v end
-  env.term = pseudoTerm
-
-  -- override os.sleep to yield to kernel
-  env.os = setmetatable({}, {__index = function(t,k) return _G.os[k] end})
-  env.os.sleep = function(t)
-    -- yield a sleep request (milliseconds)
-    coroutine.yield({type="sleep", time=(t or 1)})
-  end
-
-  -- event.pull replacement
-  env.os.pullEvent = function(name)
-    local ev = coroutine.yield({type="pullEvent", name=name})
-    -- when resumed, kernel passes the event table back
-    return table.unpack(ev or {})
-  end
-  -- also provide old-style event-based API
-  env.event = setmetatable({}, {__index=function(_,k) return _G.event[k] end})
-  env.event.pull = function(name)
-    local ev = coroutine.yield({type="pullEvent", name=name})
-    return table.unpack(ev or {})
-  end
-
-  -- loader: load the program as a chunk
-  local ok, chunkOrErr = pcall(loadfile, chunkPath)
-  if not ok or type(chunkOrErr) ~= 'function' then
-    -- return a process that prints the error then exits
-    local function errProc()
-      pseudoTerm.clear()
-      pseudoTerm.setCursorPos(1,1)
-      pseudoTerm.write("[Error loading: "..tostring(chunkPath).."]")
-      pseudoTerm.setCursorPos(1,3)
-      pseudoTerm.write(tostring(chunkOrErr))
-      coroutine.yield({type="exit"})
-    end
-    local co = coroutine.create(errProc)
-    return {pid=pid, co=co, term=pseudoTerm, path=chunkPath, args=args or {}, wake=0, status="ready"}
-  end
-
-  -- If loadfile succeeded, wrap the chunk so it gets our env
-  local chunk = chunkOrErr
-  -- try to set environment for compatibility with Lua versions
-  local setfenv = rawget(_G, 'setfenv')
-  if setfenv then setfenv(chunk, env) else
-    -- Lua 5.2+: loadfile can accept env; but if not, create a wrapper
-    -- We'll execute the chunk in env by creating a function that sets _ENV
-    local wrapper = load([[return function(...) local _ENV = ... return (function()]]..' end )']])
-    -- fallback: simpler approach is to just run chunk in a coroutine with env as _ENV
-  end
-
-  local function runner(...)
-    -- set _ENV to env for chunk execution if supported
-    local f = chunk
-    -- try load with environment
-    local success, res = pcall(function() return f(table.unpack(args or {})) end)
-    if not success then
-      -- if program errors, print to pseudoTerm
-      pseudoTerm.clear()
-      pseudoTerm.setCursorPos(1,1)
-      pseudoTerm.write("Program error: ")
-      pseudoTerm.setCursorPos(1,2)
-      pseudoTerm.write(tostring(res))
-    end
-    -- when done, yield an exit event
-    coroutine.yield({type="exit"})
-  end
-
-  local co = coroutine.create(runner)
-  return {pid=pid, co=co, term=pseudoTerm, path=chunkPath, args=args or {}, wake=0, status="ready"}
-end
-
-function Kernel:spawn(path, args)
-  local proc = makeProcess(path, args)
-  self.processes[proc.pid] = proc
-  return proc.pid
-end
-
-function Kernel:kill(pid)
-  self.processes[pid] = nil
-end
-
--- scheduler main loop (cooperative)
-function Kernel:run()
-  local timers = {}
-  local function getNextWake()
-    local soon = math.huge
-    for pid,proc in pairs(self.processes) do
-      if proc.wake and proc.wake > 0 and proc.wake < soon then soon = proc.wake end
-    end
-    return soon
-  end
-
+function Scheduler:run()
+  local lastTick = os.clock()
   while true do
-    -- check if there's any processes
-    if not next(self.processes) then
-      -- draw desktop and wait for user to launch something
-      self:drawDesktop()
-      local ev = {os.pullEvent()}
-      self:handleDesktopEvent(ev)
+    -- clean dead tasks
+    for i=#self.tasks,1,-1 do
+      if self.tasks[i].status == "dead" then table.remove(self.tasks,i) end
+    end
+    if #self.tasks == 0 then break end
+
+    -- process timers
+    local now = os.clock()
+    for id, t in pairs(self.timers) do
+      if now >= t.when then
+        -- resume task with timer event
+        self:resumeTask(t.task, "timer", id)
+        self.timers[id] = nil
+      end
     end
 
-    -- attempt to resume each process (simple round-robin)
-    for pid,proc in pairs(self.processes) do
-      if proc.status ~= "dead" then
-        -- skip sleeping processes until their wake time
-        if proc.wake and proc.wake > now() then goto continue end
-        local ok, yielded = coroutine.resume(proc.co)
+    -- default: pull an event and dispatch to tasks waiting for it
+    -- We use a single global os.pullEventRaw here and then resume the
+    -- tasks which were waiting for that event.
+    local event = table.pack(os.pullEventRaw()) -- event[1] is name
+
+    -- dispatch: resume tasks that are waiting for this event
+    for _, task in ipairs(self.tasks) do
+      if coroutine.status(task.co) ~= "dead" then
+        -- resume if task last yielded waiting for this event
+        local ok, statusOrYield = coroutine.resume(task.co) -- try resume to get its yield reason
         if not ok then
-          -- error in process; print to its pseudo-term and mark dead
-          proc.status = "dead"
+          task.status = "dead"
+          printError("[task error] " .. (task.name or "") .. ": " .. tostring(statusOrYield))
         else
-          if coroutine.status(proc.co) == 'dead' then
-            proc.status = 'dead'
-            -- leave buffer intact; kernel may remove later
+          -- if yielded something we inspect if it's a wait request and store the filter
+          if type(statusOrYield) == "table" and statusOrYield.type == "wait" then
+            task._waitingFilter = statusOrYield.filter
+            -- put task back to sleep until event occurs; we won't resume it here
           else
-            -- yielded something useful
-            if type(yielded) == 'table' then
-              if yielded.type == 'sleep' then
-                proc.wake = now() + (yielded.time*1000)
-              elseif yielded.type == 'pullEvent' then
-                -- wait until we receive the event; we register interest
-                proc.waiting = yielded.name
-              elseif yielded.type == 'exit' then
-                proc.status = 'dead'
-              end
-            end
+            -- the task yielded but not a wait table - ignore for now
           end
         end
       end
-      ::continue::
     end
 
-    -- process events from the computer and forward to interested procs
-    local timeout = 0.05
-    local evData = {os.pullEventRaw(timeout)}
-    if evData[1] then
-      -- forward event to any process waiting for it
-      for pid,proc in pairs(self.processes) do
-        if proc.waiting then
-          if not proc.waiting or proc.waiting == evData[1] then
-            proc.waiting = nil
-            -- resume and pass the event payload
-            coroutine.resume(proc.co, evData)
+    -- now dispatch the pulled event to any tasks whose filter matches
+    for _, task in ipairs(self.tasks) do
+      if task._waitingFilter ~= nil then
+        local filter = task._waitingFilter
+        local evName = event[1]
+        if (not filter) or (filter == evName) then
+          task._waitingFilter = nil
+          -- resume with the event data
+          local ok, r1 = coroutine.resume(task.co, table.unpack(event,1,event.n))
+          if not ok then
+            task.status = "dead"
+            printError("[task error] " .. (task.name or "") .. ": " .. tostring(r1))
           end
         end
       end
-      -- also allow keyboard/mouse events to control the desktop
-      self:handleGlobalEvent(evData)
     end
 
-    -- draw foreground app (pick the first non-dead process as foreground)
-    local fg = nil
-    for pid,proc in pairs(self.processes) do if proc.status ~= 'dead' then fg = proc; break end end
-    if fg then
-      -- copy its buffer to the native term so it appears on screen
-      drawBuffer(fg.term.getBuffer())
-    else
-      -- no foreground process -> draw desktop
-      self:drawDesktop()
-    end
-
-    -- cleanup dead processes
-    for pid,proc in pairs(self.processes) do if proc.status == 'dead' then self.processes[pid]=nil end end
+    -- avoid busy loop
+    os.sleep(TASK_TICK)
   end
 end
 
--- Desktop: list .lua programs in / (or /rom/programs) as icons
-function Kernel:scanPrograms()
-  local list = {}
-  local function tryAdd(path)
-    if fs.exists(path) and not fs.isDir(path) then table.insert(list, path) end
+-- NOTE: The above scheduler skeleton demonstrates the idea but is simplified.
+-- A production scheduler would keep track of which tasks are waiting and not
+-- attempt to resume every task every pull. For this starter, we'll provide a
+-- cooperative API so that many craftOS programs will work unmodified when
+-- they call os.pullEvent / os.pullEventRaw.
+
+-- == Sandboxed environment builder ==
+local function makeSandbox(scheduler, task)
+  -- sandbox env where we override os.pullEvent and os.pullEventRaw to yield
+  -- back to scheduler so other tasks may run. Also provide os.startTimer / sleep.
+  local env = {}
+  -- copy globals
+  for k,v in pairs(_ENV) do env[k]=v end
+
+  -- override os.pullEvent and os.pullEventRaw
+  env.os = shallow_copy(os)
+  env.os.pullEventRaw = function()
+    return coroutine.yield({type = "wait", filter = nil})
   end
-  -- look in root and in rom/programs
-  for _,f in ipairs(fs.list("/")) do tryAdd('/'..f) end
-  if fs.exists('/rom/programs') then for _,f in ipairs(fs.list('/rom/programs')) do tryAdd('/rom/programs/'..f) end end
-  return list
+  env.os.pullEvent = function(filter)
+    -- If filter is provided, wait until that event only
+    return coroutine.yield({type = "wait", filter = filter})
+  end
+  env.os.startTimer = function(sec)
+    local id = scheduler.nextTimerId
+    scheduler.nextTimerId = scheduler.nextTimerId + 1
+    scheduler.timers[id] = {when = os.clock() + sec, task = task}
+    return id
+  end
+  env.os.sleep = function(sec)
+    -- simple sleep using timer
+    local id = env.os.startTimer(sec)
+    -- yield waiting for timer event with id
+    local ev, tid = coroutine.yield({type = "wait", filter = "timer"})
+    while tid ~= id do
+      ev, tid = coroutine.yield({type = "wait", filter = "timer"})
+    end
+    return true
+  end
+
+  -- Provide a term redirect that uses the real term (no windows) but keeps compatibility
+  env.term = term
+
+  -- Provide shell.run to run programs using loadfile in the same sandbox
+  env.shell = shallow_copy(shell)
+  env.shell.run = function(programPath, ...)
+    -- try /rom/programs and disk paths
+    local f, err = loadfile(programPath)
+    if not f then
+      -- try with .lua
+      f, err = loadfile(programPath .. ".lua")
+    end
+    if not f then
+      -- try searching /rom/programs
+      local ok
+      local searchPaths = {"/rom/programs/", "/rom/programs/fun/", "/rom/programs/commands/"}
+      for _,p in ipairs(searchPaths) do
+        local path = p .. programPath
+        ok, err = loadfile(path)
+        if ok then f = ok; break end
+        ok, err = loadfile(path .. ".lua")
+        if ok then f = ok; break end
+      end
+      if not f then error(err or "Program not found: " .. tostring(programPath)) end
+    end
+    -- execute loaded chunk inside env
+    setfenv(f, env)
+    return f(...)
+  end
+
+  return env
 end
 
-Kernel.selected = 1
-function Kernel:drawDesktop()
-  term.setCursorPos(1,1)
+-- == Simple graphical desktop ==
+local Desktop = {}
+function Desktop.new()
+  local d = {icons = {}, tasks = {}, selected = 1}
+  return setmetatable(d, {__index = Desktop})
+end
+
+function Desktop:addIcon(label, runFunc)
+  table.insert(self.icons, {label = label, run = runFunc})
+end
+
+function Desktop:draw()
   term.clear()
-  term.setCursorPos(2,1)
-  term.write("MyCC Desktop")
-  local progs = self:scanPrograms()
-  for i=1,#progs do
-    local x = ((i-1) % 4) * 18 + 2
-    local y = math.floor((i-1) / 4) * 4 + 3
-    term.setCursorPos(x,y)
-    if i == self.selected then term.write("> ") else term.write("  ") end
-    term.write(fs.getName(progs[i]))
+  term.setCursorPos(1,1)
+  term.setCursorBlink(false)
+  -- title
+  print("CCOS - Desktop")
+  -- icons
+  local x0, y0 = 2, 3
+  local perRow = ICONS_PER_ROW
+  for i,icon in ipairs(self.icons) do
+    local col = ((i-1) % perRow)
+    local row = math.floor((i-1) / perRow)
+    local x = x0 + col * (ICON_SIZE.w + 2)
+    local y = y0 + row * (ICON_SIZE.h + 1)
+    term.setCursorPos(x, y)
+    io.write("+" .. string.rep("-", ICON_SIZE.w-2) .. "+")
+    for r=1,ICON_SIZE.h-2 do
+      term.setCursorPos(x, y+r)
+      io.write("|" .. string.rep(" ", ICON_SIZE.w-2) .. "|")
+    end
+    term.setCursorPos(x, y+ICON_SIZE.h-1)
+    io.write("+" .. string.rep("-", ICON_SIZE.w-2) .. "+")
+    -- label
+    term.setCursorPos(x+1, y+1)
+    io.write(icon.label:sub(1, ICON_SIZE.w-2))
+    if i == self.selected then
+      term.setCursorPos(x, y+ICON_SIZE.h)
+      io.write("<selected>")
+    end
+  end
+  -- taskbar
+  local tw, th = SCREEN_WIDTH, 1
+  term.setCursorPos(1, SCREEN_HEIGHT)
+  local bar = "Tasks: "
+  for _,t in ipairs(self.tasks) do bar = bar .. (t.name or "?") .. " " end
+  write(bar)
+end
+
+-- == Boot / Example apps ==
+local scheduler = Scheduler.new()
+local desktop = Desktop.new()
+
+-- Example: Clock app (simple)
+local function clockApp()
+  while true do
+    term.setCursorPos(2, SCREEN_HEIGHT-2)
+    write("Clock: " .. os.date("%H:%M:%S"))
+    os.sleep(1)
+    os.pullEvent("timer") -- cooperate with scheduler
   end
 end
 
-function Kernel:handleDesktopEvent(ev)
-  local evt = ev[1]
-  if evt == 'mouse_click' then
-    -- map mouse to icons
-    local mx,my = ev[3], ev[4]
-    local col = math.floor((mx-2)/18)
-    local row = math.floor((my-3)/4)
-    local idx = row*4 + col + 1
-    local progs = self:scanPrograms()
-    if progs[idx] then self:spawn(progs[idx]) end
-  elseif evt == 'key' then
-    local key = ev[2]
-    if key == keys.right then self.selected = math.min(self.selected+1, #self:scanPrograms())
-    elseif key == keys.left then self.selected = math.max(self.selected-1,1)
-    elseif key == keys.enter then local progs=self:scanPrograms(); if progs[self.selected] then self:spawn(progs[self.selected]) end end
+-- Example: Launcher wrapper that runs a program from disk
+local function makeLauncher(path)
+  return function()
+    -- try to run the program using sandboxed shell.run
+    local env = makeSandbox(scheduler, nil) -- make a temporary env (task will set task later)
+    local f, err = loadfile(path)
+    if not f then error(err or "cannot load") end
+    setfenv(f, env)
+    f()
   end
 end
 
-function Kernel:handleGlobalEvent(ev)
-  -- allow Ctrl+Alt+something to do kernel actions (basic example: terminate all)
-  if ev[1] == 'key' and ev[2] == keys.delete then
-    -- kill all processes
-    for pid,_ in pairs(self.processes) do self:kill(pid) end
+-- register icons
+desktop:addIcon("Clock", function()
+  local task = scheduler:createTask(function()
+    local env = makeSandbox(scheduler)
+    setfenv(clockApp, env)
+    clockApp()
+  end, "Clock")
+  table.insert(desktop.tasks, task)
+end)
+
+desktop:addIcon("Shell (run)", function()
+  -- Launch the default shell interactive in foreground (simple)
+  local task = scheduler:createTask(function()
+    local env = makeSandbox(scheduler)
+    -- run /rom/programs/shell.lua if exists
+    local f, err = loadfile("/rom/programs/shell.lua")
+    if not f then error(err or "shell not found") end
+    setfenv(f, env)
+    f()
+  end, "Shell")
+  table.insert(desktop.tasks, task)
+end)
+
+-- draw desktop once
+desktop:draw()
+
+-- simple input loop: arrow keys to select, enter to launch
+local function inputLoop()
+  while true do
+    local e = {os.pullEvent()}
+    if e[1] == "key" then
+      local key = e[2]
+      -- 203=left, 205=right, 200=up, 208=down, 28=enter
+      if key == 203 then desktop.selected = math.max(1, desktop.selected-1); desktop:draw()
+      elseif key == 205 then desktop.selected = math.min(#desktop.icons, desktop.selected+1); desktop:draw()
+      elseif key == 28 then
+        -- launch selected icon
+        local icon = desktop.icons[desktop.selected]
+        if icon and icon.run then icon.run() end
+        desktop:draw()
+      end
+    end
   end
 end
 
--- bootstrap: spawn a shell for PID 1 if user wants
-local kernel = Kernel
+-- create inputLoop as a task
+scheduler:createTask(function() inputLoop() end, "Input")
 
--- auto-launch a small shell or leave desktop
-kernel:run()
+-- run scheduler
+scheduler:run()
 
--- End of file
+print("All tasks finished - CCOS shutting down")
