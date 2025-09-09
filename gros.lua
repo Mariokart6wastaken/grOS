@@ -1,64 +1,84 @@
--- osui.lua
-local tasks = {}
-local current = nil
-local term = term
-local oldTerm = term.current()
+local jobs = {}
+local jobId = 0
+local currentFG = nil
 
--- Start a program as a coroutine
-local function startProgram(name, ...)
-    local env = setmetatable({}, { __index = _G })
-    local fn, err = loadfile(shell.resolveProgram(name), env)
-    if not fn then return nil, err end
-    local co = coroutine.create(function(...) fn(...) end)
-    table.insert(tasks, {name=name, co=co, bg=false})
-    return true
-end
-
--- Switch foreground task
-local function setForeground(idx)
-    if tasks[idx] then
-        current = idx
+-- Draws a simple status bar
+local function drawBar()
+  term.setCursorPos(1, 1)
+  term.setBackgroundColor(colors.blue)
+  term.setTextColor(colors.white)
+  term.clearLine()
+  term.write(" Jobs: ")
+  for id, job in pairs(jobs) do
+    if id == currentFG then
+      term.write("[" .. id .. ":" .. job.name .. "*] ")
+    else
+      term.write("[" .. id .. ":" .. job.name .. "] ")
     end
+  end
+  term.setBackgroundColor(colors.black)
+  term.setTextColor(colors.white)
 end
 
--- Simple scheduler
+-- Run a program in the background
+local function runBG(name, ...)
+  jobId = jobId + 1
+  local args = {...}
+  local co = coroutine.create(function()
+    shell.run(name, table.unpack(args))
+  end)
+  jobs[jobId] = {co = co, name = name}
+  return jobId
+end
+
+-- Bring job to foreground
+local function runFG(id)
+  if jobs[id] then
+    currentFG = id
+  else
+    print("No such job")
+  end
+end
+
+-- Simple job scheduler
 local function scheduler()
-    while true do
-        term.redirect(oldTerm) -- always reset term before redraw
-        -- Draw status bar
-        term.setCursorPos(1,1)
-        term.setBackgroundColor(colors.blue)
-        term.clearLine()
-        term.setTextColor(colors.white)
-        local labels = {}
-        for i, t in ipairs(tasks) do
-            local marker = (i==current) and "*" or " "
-            table.insert(labels, marker..t.name)
-        end
-        term.write(table.concat(labels, " "))
-
-        -- Resume foreground task
-        if current and tasks[current] then
-            local ok, event, p1,p2,p3,p4,p5 = coroutine.resume(tasks[current].co, os.pullEventRaw())
-            if not ok then
-                print("Task crashed: "..tostring(event))
-                table.remove(tasks, current)
-                current = #tasks > 0 and 1 or nil
-            elseif coroutine.status(tasks[current].co) == "dead" then
-                table.remove(tasks, current)
-                current = #tasks > 0 and 1 or nil
-            end
-        else
-            os.pullEvent("key") -- idle
-        end
+  while true do
+    drawBar()
+    -- Run the current foreground job
+    if currentFG and jobs[currentFG] then
+      local ok, err = coroutine.resume(jobs[currentFG].co)
+      if not ok or coroutine.status(jobs[currentFG].co) == "dead" then
+        jobs[currentFG] = nil
+        currentFG = nil
+      end
     end
+
+    -- Run background jobs without input
+    for id, job in pairs(jobs) do
+      if id ~= currentFG then
+        if coroutine.status(job.co) ~= "dead" then
+          coroutine.resume(job.co)
+        else
+          jobs[id] = nil
+        end
+      end
+    end
+    sleep(0)
+  end
 end
 
--- Boot
-local ok, err = startProgram("shell") -- start CraftOS shell
-if ok then
-    current = 1
-    scheduler()
-else
-    print("Failed to start shell: "..err)
+-- Example shell commands
+shell.setAlias("bg", "bg.lua")
+shell.setAlias("fg", "fg.lua")
+shell.setAlias("jobs", "jobs.lua")
+
+-- Tiny command handlers (you can make separate files if you want)
+_G.bg = function(...) local id = runBG(...) print("Started job " .. id) end
+_G.fg = function(id) runFG(tonumber(id)) end
+_G.jobs = function()
+  for id, job in pairs(jobs) do
+    print(id .. ": " .. job.name .. (id == currentFG and " (fg)" or " (bg)"))
+  end
 end
+
+scheduler()
